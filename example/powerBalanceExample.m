@@ -1,15 +1,14 @@
 %% load exported data
+% SParameter import via S-Parameter-toolbox from the Matlab file exchange:
+% https://de.mathworks.com/matlabcentral/fileexchange/6080-s-parameter-toolbox--+-z--y--h--g--abcd--t-
+
 load '2ch_loops.exported/e_field.mat';
 load '2ch_loops.exported/h_field.mat';
 load '2ch_loops.exported/current_density.mat';
 load '2ch_loops.exported/u_matrix.mat';
 load '2ch_loops.exported/i_matrix.mat';
 load '2ch_loops.exported/meshdata.mat';
-sMat = read(rfdata.data,'2ch_loops.exported/s_matrix.s2p');
-sMat = sMat.S_Parameters;
-e = double(e);
-c = double(c);
-h = double(h);
+[f,sMat] = SXPParse('2ch_loops.exported/s_matrix.s2p');
 
 %% crop last points in field data
 e = e(:,1:end-1,1:end-1,1:end-1,:);
@@ -46,13 +45,13 @@ pFixed = zeros(nPoints,1);
 pDecouple = zeros(nPoints,1);
 
 for k=1:nPoints
-    pRef(k) = real(v(:,k)'*pBal.cpl*v(:,k)); % reflected power
-    pRad(k) = real(v(:,k)'*pBal.rad*v(:,k)); % radiated power
-    pPhantom(k) = real(v(:,k)'*pBal.matMasked{2}*v(:,k)); % phantom absorbed power
-    pSubstrate(k) = real(v(:,k)'*pBal.matMasked{1}*v(:,k)); % substrate losses
-    pMatch(k) = real(v(:,k)'*pBal.lmpMasked{1}*v(:,k)); % mathcing cap losses
-    pFixed(k) = real(v(:,k)'*pBal.lmpMasked{2}*v(:,k)); % fixed/tuning cap losses
-    pDecouple(k) = real(v(:,k)'*pBal.lmpMasked{3}*v(:,k)); % decoupling cap losses
+    pRef(k) = real(v(:,k)'*pBal.cpl*v(:,k));
+    pRad(k) = real(v(:,k)'*pBal.rad*v(:,k));
+    pPhantom(k) = real(v(:,k)'*pBal.matMasked{2}*v(:,k));
+    pSubstrate(k) = real(v(:,k)'*pBal.matMasked{1}*v(:,k));
+    pMatch(k) = real(v(:,k)'*pBal.lmpMasked{1}*v(:,k));
+    pFixed(k) = real(v(:,k)'*pBal.lmpMasked{2}*v(:,k));
+    pDecouple(k) = real(v(:,k)'*pBal.lmpMasked{3}*v(:,k));
 end
 
 figure('color','w');
