@@ -1,5 +1,7 @@
 function powerBalance = calcPowerBalance(e, h, sigma, GridVectors, uMatrix, iMatrix, sMatrix, forwardPower, varargin)
 %calcPowerBalance: Calculate the power balance matrices of a multiport EM FDTD simulation with nPorts ports.
+%   If used for a poblication, please cite Kuehne et al. Power Balance and Loss Mechanism Analysis for RF Transmit Coil Arrays
+%   https://pubmed.ncbi.nlm.nih.gov/25324179/
 %   calcPowerBalance(e, h, sigma, GridVectors, uMatrix, iMatrix, sMatrix, forwardPower)
 %   returns a struct containing all power balance matrices.
 %
