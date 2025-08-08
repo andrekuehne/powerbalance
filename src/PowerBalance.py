@@ -9,7 +9,7 @@ element losses, and radiated power.
 from typing import Optional, List, Tuple, Union
 from dataclasses import dataclass
 import numpy as np
-
+from scipy.interpolate import RegularGridInterpolator
 
 @dataclass
 class PowerBalanceResult:
@@ -286,7 +286,21 @@ def calc_radiated_loss_matrix(
     z_line: np.ndarray,
     end_offset: int
 ) -> np.ndarray:
-    """Calculate loss matrix from power radiated into far field."""
+    """
+    Calculate loss matrix from power radiated into far field.
+    Matches MATLAB's calcRadiatedLossMatrix implementation.
+    
+    Args:
+        e_field: Electric field array of shape [nPorts, nx, ny, nz, 3]
+        h_field: Magnetic field array of shape [nPorts, nx, ny, nz, 3]
+        x_line: x coordinate vector of Yee cell vertices (length nx+1)
+        y_line: y coordinate vector of Yee cell vertices (length ny+1)
+        z_line: z coordinate vector of Yee cell vertices (length nz+1)
+        end_offset: Distance of integration box from outer boundaries in Yee cells
+        
+    Returns:
+        Power correlation matrix of shape [nPorts, nPorts]
+    """
     n_coils = e_field.shape[0]
     nx, ny, nz = e_field.shape[1:4]
     
@@ -294,187 +308,446 @@ def calc_radiated_loss_matrix(
     if end_offset >= min(nx, ny, nz) // 2:
         raise ValueError(f"end_offset ({end_offset}) too large for grid size ({nx}x{ny}x{nz})")
     
-    # Define gridlines
+    # Define grid lines and cell centers (matching MATLAB)
     dx = np.diff(x_line)
     dy = np.diff(y_line)
     dz = np.diff(z_line)
     
-    # Calculate Poynting vector on boundary surfaces
-    surfaces = _calc_poynting_surfaces_simple(
-        e_field, h_field, dx, dy, dz, end_offset, n_coils
-    )
+    cx_line = x_line[:-1] + dx / 2  # Cell centers in x
+    cy_line = y_line[:-1] + dy / 2  # Cell centers in y
+    cz_line = z_line[:-1] + dz / 2  # Cell centers in z
     
-    # Calculate power correlation matrices for each surface - following MATLAB pattern
+    # Storage for correlation matrices from each face
     matrices = []
-    for direction in ['x', 'y', 'z']:
-        for sign in ['p', 'm']:
-            surf_key = f"{direction}{sign}"
-            if surf_key not in surfaces:
-                continue
-                
-            surf = surfaces[surf_key]
-            surf_area = surf['surfArea'].ravel()
-            
-            # Extract and reshape field components 
-            if direction == 'x':
-                # For x-face: Poynting = Ey * Hz* - Ez * Hy*
-                ey_flat = surf['ey'].reshape(n_coils, -1)
-                ez_flat = surf['ez'].reshape(n_coils, -1)
-                hy_flat = surf['hy'].reshape(n_coils, -1)
-                hz_flat = surf['hz'].reshape(n_coils, -1)
-                
-                # Calculate correlation matrix: bsxfun(@times, Ey, surfArea) * Hz' - bsxfun(@times, Ez, surfArea) * Hy'
-                matrix = ((ey_flat * surf_area) @ hz_flat.conj().T - 
-                         (ez_flat * surf_area) @ hy_flat.conj().T)
-                
-            elif direction == 'y':
-                # For y-face: Poynting = Ez * Hx* - Ex * Hz*
-                ex_flat = surf['ex'].reshape(n_coils, -1)
-                ez_flat = surf['ez'].reshape(n_coils, -1)
-                hx_flat = surf['hx'].reshape(n_coils, -1)
-                hz_flat = surf['hz'].reshape(n_coils, -1)
-                
-                matrix = ((ez_flat * surf_area) @ hx_flat.conj().T - 
-                         (ex_flat * surf_area) @ hz_flat.conj().T)
-                
-            else:  # direction == 'z'
-                # For z-face: Poynting = Ex * Hy* - Ey * Hx*
-                ex_flat = surf['ex'].reshape(n_coils, -1)
-                ey_flat = surf['ey'].reshape(n_coils, -1)
-                hx_flat = surf['hx'].reshape(n_coils, -1)
-                hy_flat = surf['hy'].reshape(n_coils, -1)
-                
-                matrix = ((ex_flat * surf_area) @ hy_flat.conj().T - 
-                         (ey_flat * surf_area) @ hx_flat.conj().T)
-            
-            matrices.append(matrix)
     
-    # Sum all surface contributions
-    if not matrices:
-        return np.zeros((n_coils, n_coils), dtype=complex)
-    
-    # The factor of 0.5 and transpose match the MATLAB implementation
-    pcm = 0.5 * sum(matrices).T
-    pcm = (pcm + pcm.conj().T) / 2  # Enforce hermiticity for complex result
-    
-    return pcm  # Return real part for power matrix
-
-
-def _calc_poynting_surfaces_simple(e_field, h_field, dx, dy, dz, end_offset, n_coils):
-    """Calculate Poynting vector on boundary surfaces using simple H-field averaging."""
-    surfaces = {}
-    nx, ny, nz = e_field.shape[1:4]
-    
-    # Helper function for safe averaging
-    def safe_avg(field, idx1, idx2, axis):
-        """Safely average two field slices along an axis."""
-        if idx1 < 0 or idx2 >= field.shape[axis + 1]:  # +1 because first dim is n_coils
-            return field.take(max(0, min(idx1, idx2)), axis=axis + 1)
-        
-        f1 = field.take(idx1, axis=axis + 1)
-        f2 = field.take(idx2, axis=axis + 1)
-        return (f1 + f2) / 2
-    
+    # Process each face direction and sign
     # X-directed faces
-    for sign, x_idx in [('p', nx - 1 - end_offset), ('m', end_offset)]:
-        if x_idx < 0 or x_idx >= nx:
-            continue
-            
-        y_start, y_end = end_offset, ny - end_offset
-        z_start, z_end = end_offset, nz - end_offset
-        
-        if y_start >= y_end or z_start >= z_end:
-            continue
-        
-        # Surface area
-        sy, sz = np.meshgrid(dy[y_start:y_end], dz[z_start:z_end], indexing='ij')
-        surf_area = sy * sz
-        if sign == 'm':
-            surf_area = -surf_area
-        
-        # E field components (already at correct locations)
-        ey = e_field[:, x_idx, y_start:y_end, z_start:z_end, 1]
-        ez = e_field[:, x_idx, y_start:y_end, z_start:z_end, 2]
-        
-        # H field components (need interpolation from cell centers to face centers)
-        # For x-face: need Hy and Hz interpolated to x_line locations
-        hy = safe_avg(h_field[:, :, y_start:y_end, z_start:z_end, 1], x_idx-1, x_idx, 0)
-        hz = safe_avg(h_field[:, :, y_start:y_end, z_start:z_end, 2], x_idx-1, x_idx, 0)
-        
-        surfaces[f'x{sign}'] = {
-            'surfArea': surf_area,
-            'ey': ey,
-            'ez': ez,
-            'hy': hy,
-            'hz': hz,
-        }
+    matrices.extend(_process_x_faces(
+        e_field, h_field, x_line, y_line, z_line,
+        cx_line, cy_line, cz_line, dx, dy, dz,
+        end_offset, n_coils
+    ))
     
     # Y-directed faces
-    for sign, y_idx in [('p', ny - 1 - end_offset), ('m', end_offset)]:
-        if y_idx < 0 or y_idx >= ny:
-            continue
-            
-        x_start, x_end = end_offset, nx - end_offset
-        z_start, z_end = end_offset, nz - end_offset
-        
-        if x_start >= x_end or z_start >= z_end:
-            continue
-        
-        sx, sz = np.meshgrid(dx[x_start:x_end], dz[z_start:z_end], indexing='ij')
-        surf_area = sx * sz
-        if sign == 'm':
-            surf_area = -surf_area
-        
-        # E field components
-        ex = e_field[:, x_start:x_end, y_idx, z_start:z_end, 0]
-        ez = e_field[:, x_start:x_end, y_idx, z_start:z_end, 2]
-        
-        # H field components (interpolated to y-face)
-        hx = safe_avg(h_field[:, x_start:x_end, :, z_start:z_end, 0], y_idx-1, y_idx, 1)
-        hz = safe_avg(h_field[:, x_start:x_end, :, z_start:z_end, 2], y_idx-1, y_idx, 1)
-        
-        surfaces[f'y{sign}'] = {
-            'surfArea': surf_area,
-            'ex': ex,
-            'ez': ez,
-            'hx': hx,
-            'hz': hz,
-        }
+    matrices.extend(_process_y_faces(
+        e_field, h_field, x_line, y_line, z_line,
+        cx_line, cy_line, cz_line, dx, dy, dz,
+        end_offset, n_coils
+    ))
     
     # Z-directed faces
-    for sign, z_idx in [('p', nz - 1 - end_offset), ('m', end_offset)]:
-        if z_idx < 0 or z_idx >= nz:
-            continue
-            
-        x_start, x_end = end_offset, nx - end_offset
-        y_start, y_end = end_offset, ny - end_offset
-        
-        if x_start >= x_end or y_start >= y_end:
-            continue
-        
-        sx, sy = np.meshgrid(dx[x_start:x_end], dy[y_start:y_end], indexing='ij')
-        surf_area = sx * sy
-        if sign == 'm':
-            surf_area = -surf_area
-        
-        # E field components
-        ex = e_field[:, x_start:x_end, y_start:y_end, z_idx, 0]
-        ey = e_field[:, x_start:x_end, y_start:y_end, z_idx, 1]
-        
-        # H field components (interpolated to z-face)
-        hx = safe_avg(h_field[:, x_start:x_end, y_start:y_end, :, 0], z_idx-1, z_idx, 2)
-        hy = safe_avg(h_field[:, x_start:x_end, y_start:y_end, :, 1], z_idx-1, z_idx, 2)
-        
-        surfaces[f'z{sign}'] = {
-            'surfArea': surf_area,
-            'ex': ex,
-            'ey': ey,
-            'hx': hx,
-            'hy': hy,
-        }
+    matrices.extend(_process_z_faces(
+        e_field, h_field, x_line, y_line, z_line,
+        cx_line, cy_line, cz_line, dx, dy, dz,
+        end_offset, n_coils
+    ))
     
-    return surfaces
+    # Sum all face contributions and enforce hermiticity
+    if not matrices:
+        return np.zeros((n_coils, n_coils), dtype=e_field.dtype)
+    
+    pcm = 0.5 * sum(matrices).T
+    pcm = (pcm + pcm.conj().T) / 2
+    
+    return pcm
 
+
+def _process_x_faces(e_field, h_field, x_line, y_line, z_line,
+                     cx_line, cy_line, cz_line, dx, dy, dz,
+                     end_offset, n_coils):
+    """Process x-directed Yee faces (positive and negative)."""
+    matrices = []
+    
+    # Surface area for x-faces
+    sy, sz = np.meshgrid(
+        dy[end_offset:len(dy)-end_offset],
+        dz[end_offset:len(dz)-end_offset],
+        indexing='ij'
+    )
+    surf_area_base = sy * sz
+    
+    # Positive x face (xp)
+    x_face_idx = len(x_line) - 1 - end_offset
+    if 0 <= x_face_idx < len(x_line):
+        surf_area = surf_area_base.ravel()
+        matrix = _calc_x_face_matrix(
+            e_field, h_field, x_line, y_line, z_line,
+            cx_line, cy_line, cz_line,
+            x_face_idx, end_offset, n_coils, surf_area, 'positive'
+        )
+        if matrix is not None:
+            matrices.append(matrix)
+    
+    # Negative x face (xm)
+    x_face_idx = end_offset
+    if 0 <= x_face_idx < len(x_line):
+        surf_area = -surf_area_base.ravel()  # Negative for inward normal
+        matrix = _calc_x_face_matrix(
+            e_field, h_field, x_line, y_line, z_line,
+            cx_line, cy_line, cz_line,
+            x_face_idx, end_offset, n_coils, surf_area, 'negative'
+        )
+        if matrix is not None:
+            matrices.append(matrix)
+    
+    return matrices
+
+
+def _process_y_faces(e_field, h_field, x_line, y_line, z_line,
+                     cx_line, cy_line, cz_line, dx, dy, dz,
+                     end_offset, n_coils):
+    """Process y-directed Yee faces (positive and negative)."""
+    matrices = []
+    
+    # Surface area for y-faces
+    sx, sz = np.meshgrid(
+        dx[end_offset:len(dx)-end_offset],
+        dz[end_offset:len(dz)-end_offset],
+        indexing='ij'
+    )
+    surf_area_base = sx * sz
+    
+    # Positive y face (yp)
+    y_face_idx = len(y_line) - 1 - end_offset
+    if 0 <= y_face_idx < len(y_line):
+        surf_area = surf_area_base.ravel()
+        matrix = _calc_y_face_matrix(
+            e_field, h_field, x_line, y_line, z_line,
+            cx_line, cy_line, cz_line,
+            y_face_idx, end_offset, n_coils, surf_area, 'positive'
+        )
+        if matrix is not None:
+            matrices.append(matrix)
+    
+    # Negative y face (ym)
+    y_face_idx = end_offset
+    if 0 <= y_face_idx < len(y_line):
+        surf_area = -surf_area_base.ravel()
+        matrix = _calc_y_face_matrix(
+            e_field, h_field, x_line, y_line, z_line,
+            cx_line, cy_line, cz_line,
+            y_face_idx, end_offset, n_coils, surf_area, 'negative'
+        )
+        if matrix is not None:
+            matrices.append(matrix)
+    
+    return matrices
+
+
+def _process_z_faces(e_field, h_field, x_line, y_line, z_line,
+                     cx_line, cy_line, cz_line, dx, dy, dz,
+                     end_offset, n_coils):
+    """Process z-directed Yee faces (positive and negative)."""
+    matrices = []
+    
+    # Surface area for z-faces
+    sx, sy = np.meshgrid(
+        dx[end_offset:len(dx)-end_offset],
+        dy[end_offset:len(dy)-end_offset],
+        indexing='ij'
+    )
+    surf_area_base = sx * sy
+    
+    # Positive z face (zp)
+    z_face_idx = len(z_line) - 1 - end_offset
+    if 0 <= z_face_idx < len(z_line):
+        surf_area = surf_area_base.ravel()
+        matrix = _calc_z_face_matrix(
+            e_field, h_field, x_line, y_line, z_line,
+            cx_line, cy_line, cz_line,
+            z_face_idx, end_offset, n_coils, surf_area, 'positive'
+        )
+        if matrix is not None:
+            matrices.append(matrix)
+    
+    # Negative z face (zm)
+    z_face_idx = end_offset
+    if 0 <= z_face_idx < len(z_line):
+        surf_area = -surf_area_base.ravel()
+        matrix = _calc_z_face_matrix(
+            e_field, h_field, x_line, y_line, z_line,
+            cx_line, cy_line, cz_line,
+            z_face_idx, end_offset, n_coils, surf_area, 'negative'
+        )
+        if matrix is not None:
+            matrices.append(matrix)
+    
+    return matrices
+
+
+def _calc_x_face_matrix(e_field, h_field, x_line, y_line, z_line,
+                        cx_line, cy_line, cz_line,
+                        x_face_idx, end_offset, n_coils, surf_area, face_type):
+    """Calculate correlation matrix for an x-directed face."""
+    # Create evaluation points on the face
+    x_face = x_line[x_face_idx]
+    
+    # Meshgrid for evaluation points
+    mx, my, mz = np.meshgrid(
+        x_face,
+        cy_line[end_offset:len(cy_line)-end_offset],
+        cz_line[end_offset:len(cz_line)-end_offset],
+        indexing='ij'
+    )
+    
+    # Flatten evaluation points
+    eval_points = np.column_stack([
+        mx.ravel(),
+        my.ravel(),
+        mz.ravel()
+    ])
+    
+    # Storage for interpolated fields
+    ey_interp = np.zeros((n_coils, len(eval_points)), dtype=e_field.dtype)
+    ez_interp = np.zeros((n_coils, len(eval_points)), dtype=e_field.dtype)
+    hy_interp = np.zeros((n_coils, len(eval_points)), dtype=h_field.dtype)
+    hz_interp = np.zeros((n_coils, len(eval_points)), dtype=h_field.dtype)
+    
+    # Determine interpolation region based on face type
+    if face_type == 'positive':
+        x_idx_e = x_face_idx - 1  # E-field index
+        x_range_e = slice(max(0, x_idx_e - 1), min(len(x_line) - 1, x_idx_e + 2))
+        x_idx_h = x_face_idx - 1  # H-field center index
+        x_range_h = slice(max(0, x_idx_h - 1), min(len(cx_line), x_idx_h + 2))
+    else:  # negative
+        x_idx_e = x_face_idx - 1
+        x_range_e = slice(max(0, x_idx_e - 1), min(len(x_line) - 1, x_idx_e + 2))
+        x_idx_h = x_face_idx - 1
+        x_range_h = slice(max(0, x_idx_h - 1), min(len(cx_line), x_idx_h + 2))
+    
+    # Interpolate fields for each coil
+    for coil in range(n_coils):
+        # Ey interpolation (on x_line, cy_line, z_line[:-1])
+        ey_interp[coil] = _interpolate_field_component(
+            e_field[coil, x_range_e, :, :, 1],
+            x_line[x_range_e], cy_line, z_line[:-1],
+            eval_points
+        )
+        
+        # Ez interpolation (on x_line, y_line[:-1], cz_line)
+        ez_interp[coil] = _interpolate_field_component(
+            e_field[coil, x_range_e, :, :, 2],
+            x_line[x_range_e], y_line[:-1], cz_line,
+            eval_points
+        )
+        
+        # Hy interpolation (on cx_line, y_line[:-1], cz_line)
+        hy_interp[coil] = _interpolate_field_component(
+            h_field[coil, x_range_h, :, :, 1],
+            cx_line[x_range_h], y_line[:-1], cz_line,
+            eval_points
+        )
+        
+        # Hz interpolation (on cx_line, cy_line, z_line[:-1])
+        hz_interp[coil] = _interpolate_field_component(
+            h_field[coil, x_range_h, :, :, 2],
+            cx_line[x_range_h], cy_line, z_line[:-1],
+            eval_points
+        )
+    
+    # Calculate correlation matrix: Ey*surfArea @ Hz' - Ez*surfArea @ Hy'
+    matrix = (
+        (ey_interp * surf_area) @ hz_interp.conj().T -
+        (ez_interp * surf_area) @ hy_interp.conj().T
+    )
+    
+    return matrix
+
+
+def _calc_y_face_matrix(e_field, h_field, x_line, y_line, z_line,
+                        cx_line, cy_line, cz_line,
+                        y_face_idx, end_offset, n_coils, surf_area, face_type):
+    """Calculate correlation matrix for a y-directed face."""
+    # Create evaluation points on the face
+    y_face = y_line[y_face_idx]
+    
+    mx, my, mz = np.meshgrid(
+        cx_line[end_offset:len(cx_line)-end_offset],
+        y_face,
+        cz_line[end_offset:len(cz_line)-end_offset],
+        indexing='ij'
+    )
+    
+    eval_points = np.column_stack([
+        mx.ravel(),
+        my.ravel(),
+        mz.ravel()
+    ])
+    
+    # Storage for interpolated fields
+    ex_interp = np.zeros((n_coils, len(eval_points)), dtype=e_field.dtype)
+    ez_interp = np.zeros((n_coils, len(eval_points)), dtype=e_field.dtype)
+    hx_interp = np.zeros((n_coils, len(eval_points)), dtype=h_field.dtype)
+    hz_interp = np.zeros((n_coils, len(eval_points)), dtype=h_field.dtype)
+    
+    # Determine interpolation region
+    if face_type == 'positive':
+        y_idx_e = y_face_idx - 1
+        y_range_e = slice(max(0, y_idx_e - 1), min(len(y_line) - 1, y_idx_e + 2))
+        y_idx_h = y_face_idx - 1
+        y_range_h = slice(max(0, y_idx_h - 1), min(len(cy_line), y_idx_h + 2))
+    else:
+        y_idx_e = y_face_idx - 1
+        y_range_e = slice(max(0, y_idx_e - 1), min(len(y_line) - 1, y_idx_e + 2))
+        y_idx_h = y_face_idx - 1
+        y_range_h = slice(max(0, y_idx_h - 1), min(len(cy_line), y_idx_h + 2))
+    
+    # Interpolate fields for each coil
+    for coil in range(n_coils):
+        # Ex interpolation (on cx_line, y_line, z_line[:-1])
+        ex_interp[coil] = _interpolate_field_component(
+            e_field[coil, :, y_range_e, :, 0],
+            cx_line, y_line[y_range_e], z_line[:-1],
+            eval_points
+        )
+        
+        # Ez interpolation (on x_line[:-1], y_line, cz_line)
+        ez_interp[coil] = _interpolate_field_component(
+            e_field[coil, :, y_range_e, :, 2],
+            x_line[:-1], y_line[y_range_e], cz_line,
+            eval_points
+        )
+        
+        # Hx interpolation (on x_line[:-1], cy_line, cz_line)
+        hx_interp[coil] = _interpolate_field_component(
+            h_field[coil, :, y_range_h, :, 0],
+            x_line[:-1], cy_line[y_range_h], cz_line,
+            eval_points
+        )
+        
+        # Hz interpolation (on cx_line, cy_line, z_line[:-1])
+        hz_interp[coil] = _interpolate_field_component(
+            h_field[coil, :, y_range_h, :, 2],
+            cx_line, cy_line[y_range_h], z_line[:-1],
+            eval_points
+        )
+    
+    # Calculate correlation matrix: Ez*surfArea @ Hx' - Ex*surfArea @ Hz'
+    matrix = (
+        (ez_interp * surf_area) @ hx_interp.conj().T -
+        (ex_interp * surf_area) @ hz_interp.conj().T
+    )
+    
+    return matrix
+
+
+def _calc_z_face_matrix(e_field, h_field, x_line, y_line, z_line,
+                        cx_line, cy_line, cz_line,
+                        z_face_idx, end_offset, n_coils, surf_area, face_type):
+    """Calculate correlation matrix for a z-directed face."""
+    # Create evaluation points on the face
+    z_face = z_line[z_face_idx]
+    
+    mx, my, mz = np.meshgrid(
+        cx_line[end_offset:len(cx_line)-end_offset],
+        cy_line[end_offset:len(cy_line)-end_offset],
+        z_face,
+        indexing='ij'
+    )
+    
+    eval_points = np.column_stack([
+        mx.ravel(),
+        my.ravel(),
+        mz.ravel()
+    ])
+    
+    # Storage for interpolated fields
+    ex_interp = np.zeros((n_coils, len(eval_points)), dtype=e_field.dtype)
+    ey_interp = np.zeros((n_coils, len(eval_points)), dtype=e_field.dtype)
+    hx_interp = np.zeros((n_coils, len(eval_points)), dtype=h_field.dtype)
+    hy_interp = np.zeros((n_coils, len(eval_points)), dtype=h_field.dtype)
+    
+    # Determine interpolation region
+    if face_type == 'positive':
+        z_idx_e = z_face_idx - 1
+        z_range_e = slice(max(0, z_idx_e - 1), min(len(z_line) - 1, z_idx_e + 2))
+        z_idx_h = z_face_idx - 1
+        z_range_h = slice(max(0, z_idx_h - 1), min(len(cz_line), z_idx_h + 2))
+    else:
+        z_idx_e = z_face_idx - 1
+        z_range_e = slice(max(0, z_idx_e - 1), min(len(z_line) - 1, z_idx_e + 2))
+        z_idx_h = z_face_idx - 1
+        z_range_h = slice(max(0, z_idx_h - 1), min(len(cz_line), z_idx_h + 2))
+    
+    # Interpolate fields for each coil
+    for coil in range(n_coils):
+        # Ex interpolation (on cx_line, y_line[:-1], z_line)
+        ex_interp[coil] = _interpolate_field_component(
+            e_field[coil, :, :, z_range_e, 0],
+            cx_line, y_line[:-1], z_line[z_range_e],
+            eval_points
+        )
+        
+        # Ey interpolation (on x_line[:-1], cy_line, z_line)
+        ey_interp[coil] = _interpolate_field_component(
+            e_field[coil, :, :, z_range_e, 1],
+            x_line[:-1], cy_line, z_line[z_range_e],
+            eval_points
+        )
+        
+        # Hx interpolation (on x_line[:-1], cy_line, cz_line)
+        hx_interp[coil] = _interpolate_field_component(
+            h_field[coil, :, :, z_range_h, 0],
+            x_line[:-1], cy_line, cz_line[z_range_h],
+            eval_points
+        )
+        
+        # Hy interpolation (on cx_line, y_line[:-1], cz_line)
+        hy_interp[coil] = _interpolate_field_component(
+            h_field[coil, :, :, z_range_h, 1],
+            cx_line, y_line[:-1], cz_line[z_range_h],
+            eval_points
+        )
+    
+    # Calculate correlation matrix: Ex*surfArea @ Hy' - Ey*surfArea @ Hx'
+    matrix = (
+        (ex_interp * surf_area) @ hy_interp.conj().T -
+        (ey_interp * surf_area) @ hx_interp.conj().T
+    )
+    
+    return matrix
+
+
+def _interpolate_field_component(field_data, x_grid, y_grid, z_grid, eval_points):
+    """
+    Interpolate a field component to evaluation points.
+    Uses scipy's RegularGridInterpolator to match MATLAB's griddedInterpolant.
+    
+    Args:
+        field_data: 3D field data array
+        x_grid, y_grid, z_grid: Grid coordinate vectors
+        eval_points: Points where field should be evaluated
+        
+    Returns:
+        Interpolated field values at evaluation points
+    """
+    # Handle edge cases where grid is too small
+    if len(x_grid) < 2 or len(y_grid) < 2 or len(z_grid) < 2:
+        return np.zeros(len(eval_points), dtype=field_data.dtype)
+    
+    # Ensure field data matches grid dimensions
+    expected_shape = (len(x_grid), len(y_grid), len(z_grid))
+    if field_data.shape != expected_shape:
+        # Reshape or pad as needed
+        reshaped = np.zeros(expected_shape, dtype=field_data.dtype)
+        min_shape = tuple(min(s1, s2) for s1, s2 in zip(field_data.shape, expected_shape))
+        reshaped[:min_shape[0], :min_shape[1], :min_shape[2]] = \
+            field_data[:min_shape[0], :min_shape[1], :min_shape[2]]
+        field_data = reshaped
+    
+    # Create interpolator
+    # Use 'linear' method to match MATLAB's default behavior
+    # bounds_error=False and fill_value=0 to handle edge cases
+    interpolator = RegularGridInterpolator(
+        (x_grid, y_grid, z_grid),
+        field_data,
+        method='linear',
+        bounds_error=False,
+        fill_value=0.0
+    )
+    
+    # Evaluate at points
+    return interpolator(eval_points)
 
 # Example usage
 if __name__ == "__main__":
